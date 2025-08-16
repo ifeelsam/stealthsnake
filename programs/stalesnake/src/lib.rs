@@ -8,7 +8,7 @@ const PLATFORM_FEE_BPS: u16 = 500; // 5% platform fee
 declare_id!("EZLXMbgSwoXWBDB1xLd43bKjtVjAxDYPRqNcZir2idyr");
 
 #[arcium_program]
-pub mod arena_stake {
+pub mod stale_snake {
     use super::*;
 
     pub fn init_battle_comp_def(ctx: Context<InitBattleCompDef>) -> Result<()> {
