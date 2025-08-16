@@ -9,6 +9,8 @@ declare_id!("EZLXMbgSwoXWBDB1xLd43bKjtVjAxDYPRqNcZir2idyr");
 
 #[arcium_program]
 pub mod stale_snake {
+    use arcium_client::idl::arcium::types::CallbackAccount;
+
     use super::*;
 
     pub fn init_battle_comp_def(ctx: Context<InitBattleCompDef>) -> Result<()> {
@@ -104,7 +106,11 @@ pub mod stale_snake {
             ctx.accounts,
             computation_offset,
             args,
-            vec![],
+            vec![ CallbackAccount {
+                pubkey: ctx.accounts.duel_order.key(),
+                is_writable: true,
+
+            }],
             None,
         )?;
 
