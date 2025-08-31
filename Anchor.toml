@@ -6,7 +6,7 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-stalesnake = "EZLXMbgSwoXWBDB1xLd43bKjtVjAxDYPRqNcZir2idyr"
+stalesnake = "DUrqKd64caWsHCL132QaHMUsK3MPHrnQwZtWJo4UFLSm"
 
 [registry]
 url = "https://api.apr.dev"
@@ -18,7 +18,16 @@ wallet = "~/.config/solana/id.json"
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
 
-[test.validator]
+[test]
+startup_wait = 5000
+shutdown_wait = 2000
+upgradeable = false
+
 [[test.genesis]]
 address = "BKck65TgoKRokMjQM3datB9oRwJ8rAj2jxPXvHXUvcL6"
 program = "/home/sam/Projects/stalesnake/artifacts/arcium_program_0.2.0.so"
+
+[test.validator]
+bind_address = "0.0.0.0"
+ledger = ".anchor/test-ledger"
+rpc_port = 8899

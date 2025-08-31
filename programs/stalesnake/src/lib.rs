@@ -1,11 +1,10 @@
 use anchor_lang::prelude::*;
-use arcium_anchor::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use arcium_anchor::prelude::*;
 
 const COMP_DEF_OFFSET_BATTLE: u32 = comp_def_offset("execute_battle");
 
-
-declare_id!("EZLXMbgSwoXWBDB1xLd43bKjtVjAxDYPRqNcZir2idyr");
+declare_id!("DUrqKd64caWsHCL132QaHMUsK3MPHrnQwZtWJo4UFLSm");
 
 #[arcium_program]
 pub mod stale_snake {
@@ -32,6 +31,7 @@ pub mod stale_snake {
             duel.duel_id = duel_id;
             duel.player1 = ctx.accounts.player.key();
             duel.player1_stats = encrypted_stats;
+            duel.player1_mint = ctx.accounts.token_mint.key();
             duel.stake_amount = stake_amount;
             duel.status = DuelStatus::WaitingForOpponent;
 
@@ -45,6 +45,7 @@ pub mod stale_snake {
 
             duel.player2 = ctx.accounts.player.key();
             duel.player2_stats = encrypted_stats;
+            duel.player2_mint = ctx.accounts.token_mint.key();
             duel.status = DuelStatus::ReadyToBattle;
 
             msg!("Player 2 joined. Battle ready!");
@@ -79,7 +80,7 @@ pub mod stale_snake {
         player2_nonce: u128,
     ) -> Result<()> {
         let duel = &ctx.accounts.duel_order;
-        
+
         require!(
             duel.status == DuelStatus::ReadyToBattle,
             ErrorCode::BattleNotReady
@@ -93,7 +94,6 @@ pub mod stale_snake {
             Argument::EncryptedU16(duel.player1_stats.attack),
             Argument::EncryptedU16(duel.player1_stats.defense),
             Argument::EncryptedU16(duel.player1_stats.speed),
-
             // Player 2 encrypted stats
             Argument::ArcisPubkey(player2_pubkey),
             Argument::PlaintextU128(player2_nonce),
@@ -106,10 +106,9 @@ pub mod stale_snake {
             ctx.accounts,
             computation_offset,
             args,
-            vec![ CallbackAccount {
+            vec![CallbackAccount {
                 pubkey: ctx.accounts.duel_order.key(),
                 is_writable: true,
-
             }],
             None,
         )?;
@@ -137,11 +136,11 @@ pub mod stale_snake {
             1 => {
                 duel.winner = duel.player1;
                 msg!("Player 1 wins!");
-            },
+            }
             2 => {
                 duel.winner = duel.player2;
                 msg!("Player 2 wins!");
-            },
+            }
             _ => {
                 duel.winner = Pubkey::default();
                 msg!("Draw!");
@@ -167,15 +166,12 @@ pub mod stale_snake {
             ErrorCode::BattleNotCompleted
         );
 
-        let is_player1 = ctx.accounts.player.key() == duel.player1;
-        let is_player2 = ctx.accounts.player.key() == duel.player2;
+        let is_player1 = ctx.accounts.winner.key() == duel.player1;
+        let is_player2 = ctx.accounts.winner.key() == duel.player2;
 
-        require!(
-            is_player1 || is_player2,
-            ErrorCode::NotAParticipant
-        );
+        require!(is_player1 || is_player2, ErrorCode::NotAParticipant);
 
-        let amount = if duel.winner == ctx.accounts.player.key() {
+        let amount = if duel.winner == ctx.accounts.winner.key() {
             // Winner gets both stakes
             duel.stake_amount * 2
         } else if duel.winner == Pubkey::default() {
@@ -187,30 +183,51 @@ pub mod stale_snake {
         };
 
         if amount > 0 {
-            // Transfer from vault
-            let duel_key = duel.key();
+            let duel_order_key = ctx.accounts.duel_order.key();
+            let player1_mint = ctx.accounts.duel_order.player1_mint;
+            let player2_mint = ctx.accounts.duel_order.player2_mint;
 
-            let seeds = &[
+            let player1_vault_seeds = &[
                 b"vault",
-                duel_key.as_ref(),
-                &[ctx.bumps.vault],
+                duel_order_key.as_ref(),
+                player1_mint.as_ref(),
+                &[ctx.bumps.player1_vault],
             ];
-            let signer = &[&seeds[..]];
+            let player1_vault_signer = &[&player1_vault_seeds[..]];
 
-            let cpi_accounts = Transfer {
-                from: ctx.accounts.vault.to_account_info(),
-                to: ctx.accounts.player_token_account.to_account_info(),
-                authority: ctx.accounts.vault.to_account_info(),
+            let cpi_accounts_p1 = Transfer {
+                from: ctx.accounts.player1_vault.to_account_info(),
+                to: ctx.accounts.winner_token_account.to_account_info(),
+                authority: ctx.accounts.player1_vault.to_account_info(),
             };
             let cpi_program = ctx.accounts.token_program.to_account_info();
-            let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
-            token::transfer(cpi_ctx, amount)?;
+            let cpi_ctx =
+                CpiContext::new_with_signer(cpi_program, cpi_accounts_p1, player1_vault_signer);
+            token::transfer(cpi_ctx, ctx.accounts.player1_vault.amount)?;
 
-            emit!(RewardClaimedEvent {
-                player: ctx.accounts.player.key(),
-                amount,
-            });
+            let player2_vault_seeds = &[
+                b"vault",
+                duel_order_key.as_ref(),
+                player2_mint.as_ref(),
+                &[ctx.bumps.player2_vault],
+            ];
+            let player2_vault_signer = &[&player2_vault_seeds[..]];
+
+            let cpi_accounts_p2 = Transfer {
+                from: ctx.accounts.player2_vault.to_account_info(),
+                to: ctx.accounts.winner_token_account2.to_account_info(),
+                authority: ctx.accounts.player2_vault.to_account_info(),
+            };
+            let cpi_program = ctx.accounts.token_program.to_account_info();
+            let cpi_ctx =
+                CpiContext::new_with_signer(cpi_program, cpi_accounts_p2, player2_vault_signer);
+            token::transfer(cpi_ctx, ctx.accounts.player2_vault.amount)?;
         }
+
+        emit!(RewardClaimedEvent {
+            player: ctx.accounts.winner.key(),
+            amount,
+        });
 
         Ok(())
     }
@@ -223,6 +240,8 @@ pub struct DuelOrder {
     pub duel_id: u64,
     pub player1: Pubkey,
     pub player2: Pubkey,
+    pub player1_mint: Pubkey,
+    pub player2_mint: Pubkey,
     pub player1_stats: EncryptedStats,
     pub player2_stats: EncryptedStats,
     pub stake_amount: u64,
@@ -251,7 +270,7 @@ pub enum DuelStatus {
 pub struct StakeAndJoin<'info> {
     #[account(mut)]
     pub player: Signer<'info>,
-    
+
     #[account(
         init_if_needed,
         payer = player,
@@ -260,20 +279,20 @@ pub struct StakeAndJoin<'info> {
         bump,
     )]
     pub duel_order: Account<'info, DuelOrder>,
-    
+
     #[account(mut)]
     pub player_token_account: Account<'info, TokenAccount>,
-    
+
     #[account(
         init_if_needed,
         payer = player,
         token::mint = token_mint,
         token::authority = vault,
-        seeds = [b"vault", duel_order.key().as_ref()],
+        seeds = [b"vault", duel_order.key().as_ref(), token_mint.key().as_ref()],
         bump,
     )]
     pub vault: Account<'info, TokenAccount>,
-    
+
     /// CHECK: Token mint
     pub token_mint: AccountInfo<'info>,
     pub token_program: Program<'info, Token>,
@@ -286,37 +305,37 @@ pub struct StakeAndJoin<'info> {
 pub struct StartBattle<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
-    
+
     #[account(mut)]
     pub duel_order: Account<'info, DuelOrder>,
-    
+
     #[account(address = derive_mxe_pda!())]
     pub mxe_account: Account<'info, MXEAccount>,
-    
+
     #[account(mut, address = derive_mempool_pda!())]
     /// CHECK: Arcium mempool
     pub mempool_account: UncheckedAccount<'info>,
-    
+
     #[account(mut, address = derive_execpool_pda!())]
     /// CHECK: Arcium execution pool
     pub executing_pool: UncheckedAccount<'info>,
-    
+
     #[account(mut, address = derive_comp_pda!(computation_offset))]
     /// CHECK: Computation account
     pub computation_account: UncheckedAccount<'info>,
-    
+
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_BATTLE))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
-    
+
     #[account(mut, address = derive_cluster_pda!(mxe_account))]
     pub cluster_account: Account<'info, Cluster>,
-    
+
     #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
     pub pool_account: Account<'info, FeePool>,
-    
+
     #[account(address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
     pub clock_account: Account<'info, ClockAccount>,
-    
+
     pub system_program: Program<'info, System>,
     pub arcium_program: Program<'info, Arcium>,
 }
@@ -327,35 +346,51 @@ pub struct BattleResultCallback<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     pub arcium_program: Program<'info, Arcium>,
-    
+
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_BATTLE))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
-    
+
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
     /// CHECK: Instructions sysvar
     pub instructions_sysvar: AccountInfo<'info>,
-    
+
     #[account(mut)]
     pub duel_order: Account<'info, DuelOrder>,
 }
 
 #[derive(Accounts)]
 pub struct ClaimRewards<'info> {
-    pub player: Signer<'info>,
-    
+    pub winner: Signer<'info>,
+
+    /// the nfts and staked amount will be transfered to this ata
+    #[account(mut)]
+    pub winner_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub winner_token_account2: Account<'info, TokenAccount>,
+
     #[account(mut)]
     pub duel_order: Account<'info, DuelOrder>,
-    
+
+    // now we need to get both the vaults
     #[account(
         mut,
-        seeds = [b"vault", duel_order.key().as_ref()],
-        bump,
+        token::mint = duel_order.player2_mint,
+        token::authority = player1_vault,
+        seeds = [b"vault", duel_order.key().as_ref(), player1_vault.key().as_ref()],
+        bump
     )]
-    pub vault: Account<'info, TokenAccount>,
-    
-    #[account(mut)]
-    pub player_token_account: Account<'info, TokenAccount>,
-    
+    pub player1_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        token::mint = duel_order.player2_mint,
+        token::authority = player2_vault,
+        seeds = [b"vault", duel_order.key().as_ref(), player2_vault.key().as_ref()],
+        bump
+    )]
+    pub player2_vault: Account<'info, TokenAccount>,
+
     pub token_program: Program<'info, Token>,
 }
 
@@ -364,14 +399,14 @@ pub struct ClaimRewards<'info> {
 pub struct InitBattleCompDef<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
-    
+
     #[account(mut, address = derive_mxe_pda!())]
     pub mxe_account: Box<Account<'info, MXEAccount>>,
-    
+
     #[account(mut)]
     /// CHECK: Comp def account
     pub comp_def_account: UncheckedAccount<'info>,
-    
+
     pub arcium_program: Program<'info, Arcium>,
     pub system_program: Program<'info, System>,
 }
@@ -408,7 +443,7 @@ pub enum ErrorCode {
     #[msg("Battle not completed yet")]
     BattleNotCompleted,
     #[msg("You are not a participant in this duel")]
-    NotAParticipant, 
+    NotAParticipant,
     #[msg("Cluster Not Set")]
     ClusterNotSet,
 }
