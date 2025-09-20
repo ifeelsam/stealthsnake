@@ -3,235 +3,9 @@ use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use arcium_anchor::prelude::*;
 
 const COMP_DEF_OFFSET_BATTLE: u32 = comp_def_offset("execute_battle");
+const SIGN_PDA_SEED: &[u8] = b"sign";
 
 declare_id!("DUrqKd64caWsHCL132QaHMUsK3MPHrnQwZtWJo4UFLSm");
-
-#[arcium_program]
-pub mod stale_snake {
-    use arcium_client::idl::arcium::types::CallbackAccount;
-
-    use super::*;
-
-    pub fn init_battle_comp_def(ctx: Context<InitBattleCompDef>) -> Result<()> {
-        init_comp_def(ctx.accounts, true, 0, None, None)?;
-        Ok(())
-    }
-
-    /// Step 1: Player stakes assets and creates/joins a duel
-    pub fn stake_and_join(
-        ctx: Context<StakeAndJoin>,
-        duel_id: u64,
-        stake_amount: u64,
-        encrypted_stats: EncryptedStats,
-    ) -> Result<()> {
-        let duel = &mut ctx.accounts.duel_order;
-
-        if duel.player1 == Pubkey::default() {
-            // First player creates the duel
-            duel.duel_id = duel_id;
-            duel.player1 = ctx.accounts.player.key();
-            duel.player1_stats = encrypted_stats;
-            duel.player1_mint = ctx.accounts.token_mint.key();
-            duel.stake_amount = stake_amount;
-            duel.status = DuelStatus::WaitingForOpponent;
-
-            msg!("Player 1 joined. Waiting for opponent...");
-        } else {
-            // Second player joins
-            require!(
-                duel.status == DuelStatus::WaitingForOpponent,
-                ErrorCode::DuelNotOpen
-            );
-
-            duel.player2 = ctx.accounts.player.key();
-            duel.player2_stats = encrypted_stats;
-            duel.player2_mint = ctx.accounts.token_mint.key();
-            duel.status = DuelStatus::ReadyToBattle;
-
-            msg!("Player 2 joined. Battle ready!");
-        }
-
-        // Transfer stake to vault
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.player_token_account.to_account_info(),
-            to: ctx.accounts.vault.to_account_info(),
-            authority: ctx.accounts.player.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-        token::transfer(cpi_ctx, stake_amount)?;
-
-        emit!(PlayerJoinedEvent {
-            duel_id,
-            player: ctx.accounts.player.key(),
-            stake: stake_amount,
-        });
-
-        Ok(())
-    }
-
-    /// Step 2: Execute the battle through MPC
-    pub fn start_battle(
-        ctx: Context<StartBattle>,
-        computation_offset: u64,
-        player1_pubkey: [u8; 32],
-        player1_nonce: u128,
-        player2_pubkey: [u8; 32],
-        player2_nonce: u128,
-    ) -> Result<()> {
-        let duel = &ctx.accounts.duel_order;
-
-        require!(
-            duel.status == DuelStatus::ReadyToBattle,
-            ErrorCode::BattleNotReady
-        );
-
-        // Prepare encrypted data for MPC
-        let args = vec![
-            // Player 1 encrypted stats
-            Argument::ArcisPubkey(player1_pubkey),
-            Argument::PlaintextU128(player1_nonce),
-            Argument::EncryptedU16(duel.player1_stats.attack),
-            Argument::EncryptedU16(duel.player1_stats.defense),
-            Argument::EncryptedU16(duel.player1_stats.speed),
-            // Player 2 encrypted stats
-            Argument::ArcisPubkey(player2_pubkey),
-            Argument::PlaintextU128(player2_nonce),
-            Argument::EncryptedU16(duel.player2_stats.attack),
-            Argument::EncryptedU16(duel.player2_stats.defense),
-            Argument::EncryptedU16(duel.player2_stats.speed),
-        ];
-
-        queue_computation(
-            ctx.accounts,
-            computation_offset,
-            args,
-            vec![CallbackAccount {
-                pubkey: ctx.accounts.duel_order.key(),
-                is_writable: true,
-            }],
-            None,
-        )?;
-
-        let duel = &mut ctx.accounts.duel_order;
-        duel.status = DuelStatus::BattleInProgress;
-
-        Ok(())
-    }
-
-    /// Step 3: Handle battle result from MPC
-    #[arcium_callback(encrypted_ix = "execute_battle")]
-    pub fn execute_battle_callback(
-        ctx: Context<BattleResultCallback>,
-        output: ComputationOutputs<ExecuteBattleOutput>,
-    ) -> Result<()> {
-        let result = match output {
-            ComputationOutputs::Success(ExecuteBattleOutput { field_0 }) => field_0,
-            _ => return Err(ErrorCode::BattleFailed.into()),
-        };
-
-        let duel = &mut ctx.accounts.duel_order;
-
-        match result {
-            1 => {
-                duel.winner = duel.player1;
-                msg!("Player 1 wins!");
-            }
-            2 => {
-                duel.winner = duel.player2;
-                msg!("Player 2 wins!");
-            }
-            _ => {
-                duel.winner = Pubkey::default();
-                msg!("Draw!");
-            }
-        }
-
-        duel.status = DuelStatus::Completed;
-
-        emit!(BattleCompletedEvent {
-            duel_id: duel.duel_id,
-            winner: duel.winner,
-        });
-
-        Ok(())
-    }
-
-    /// Step 4: Release assets from vault
-    pub fn claim_rewards(ctx: Context<ClaimRewards>) -> Result<()> {
-        let duel = &ctx.accounts.duel_order;
-
-        require!(
-            duel.status == DuelStatus::Completed,
-            ErrorCode::BattleNotCompleted
-        );
-
-        let is_player1 = ctx.accounts.winner.key() == duel.player1;
-        let is_player2 = ctx.accounts.winner.key() == duel.player2;
-
-        require!(is_player1 || is_player2, ErrorCode::NotAParticipant);
-
-        let amount = if duel.winner == ctx.accounts.winner.key() {
-            // Winner gets both stakes
-            duel.stake_amount * 2
-        } else if duel.winner == Pubkey::default() {
-            // Draw - return original stake
-            duel.stake_amount
-        } else {
-            // Loser gets nothing
-            0
-        };
-
-        if amount > 0 {
-            let duel_order_key = ctx.accounts.duel_order.key();
-            let player1_mint = ctx.accounts.duel_order.player1_mint;
-            let player2_mint = ctx.accounts.duel_order.player2_mint;
-
-            let player1_vault_seeds = &[
-                b"vault",
-                duel_order_key.as_ref(),
-                player1_mint.as_ref(),
-                &[ctx.bumps.player1_vault],
-            ];
-            let player1_vault_signer = &[&player1_vault_seeds[..]];
-
-            let cpi_accounts_p1 = Transfer {
-                from: ctx.accounts.player1_vault.to_account_info(),
-                to: ctx.accounts.winner_token_account.to_account_info(),
-                authority: ctx.accounts.player1_vault.to_account_info(),
-            };
-            let cpi_program = ctx.accounts.token_program.to_account_info();
-            let cpi_ctx =
-                CpiContext::new_with_signer(cpi_program, cpi_accounts_p1, player1_vault_signer);
-            token::transfer(cpi_ctx, ctx.accounts.player1_vault.amount)?;
-
-            let player2_vault_seeds = &[
-                b"vault",
-                duel_order_key.as_ref(),
-                player2_mint.as_ref(),
-                &[ctx.bumps.player2_vault],
-            ];
-            let player2_vault_signer = &[&player2_vault_seeds[..]];
-
-            let cpi_accounts_p2 = Transfer {
-                from: ctx.accounts.player2_vault.to_account_info(),
-                to: ctx.accounts.winner_token_account2.to_account_info(),
-                authority: ctx.accounts.player2_vault.to_account_info(),
-            };
-            let cpi_program = ctx.accounts.token_program.to_account_info();
-            let cpi_ctx =
-                CpiContext::new_with_signer(cpi_program, cpi_accounts_p2, player2_vault_signer);
-            token::transfer(cpi_ctx, ctx.accounts.player2_vault.amount)?;
-        }
-
-        emit!(RewardClaimedEvent {
-            player: ctx.accounts.winner.key(),
-            amount,
-        });
-
-        Ok(())
-    }
-}
 
 // Account Structures
 #[account]
@@ -306,6 +80,16 @@ pub struct StartBattle<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
 
+    #[account(
+        init_if_needed,
+        space = 9,
+        payer = payer,
+        seeds = [&SIGN_PDA_SEED],
+        bump,
+        address = derive_sign_pda!(),
+    )]
+    pub sign_pda_account: Account<'info, SignerAccount>,
+
     #[account(mut)]
     pub duel_order: Account<'info, DuelOrder>,
 
@@ -340,11 +124,9 @@ pub struct StartBattle<'info> {
     pub arcium_program: Program<'info, Arcium>,
 }
 
-#[callback_accounts("execute_battle", payer)]
+#[callback_accounts("execute_battle")]
 #[derive(Accounts)]
-pub struct BattleResultCallback<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
+pub struct ExecuteBattleCallback<'info> {
     pub arcium_program: Program<'info, Arcium>,
 
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_BATTLE))]
@@ -446,4 +228,227 @@ pub enum ErrorCode {
     NotAParticipant,
     #[msg("Cluster Not Set")]
     ClusterNotSet,
+}
+
+#[arcium_program]
+pub mod stale_snake {
+    
+    use super::*;
+
+    pub fn init_battle_comp_def(ctx: Context<InitBattleCompDef>) -> Result<()> {
+        init_comp_def(ctx.accounts, true, 0, None, None)?;
+        Ok(())
+    }
+
+    /// Step 1: Player stakes assets and creates/joins a duel
+    pub fn stake_and_join(
+        ctx: Context<StakeAndJoin>,
+        duel_id: u64,
+        stake_amount: u64,
+        encrypted_stats: EncryptedStats,
+    ) -> Result<()> {
+        let duel = &mut ctx.accounts.duel_order;
+
+        if duel.player1 == Pubkey::default() {
+            // First player creates the duel
+            duel.duel_id = duel_id;
+            duel.player1 = ctx.accounts.player.key();
+            duel.player1_stats = encrypted_stats;
+            duel.player1_mint = ctx.accounts.token_mint.key();
+            duel.stake_amount = stake_amount;
+            duel.status = DuelStatus::WaitingForOpponent;
+
+            msg!("Player 1 joined. Waiting for opponent...");
+        } else {
+            // Second player joins
+            require!(
+                duel.status == DuelStatus::WaitingForOpponent,
+                ErrorCode::DuelNotOpen
+            );
+
+            duel.player2 = ctx.accounts.player.key();
+            duel.player2_stats = encrypted_stats;
+            duel.player2_mint = ctx.accounts.token_mint.key();
+            duel.status = DuelStatus::ReadyToBattle;
+
+            msg!("Player 2 joined. Battle ready!");
+        }
+
+        // Transfer stake to vault
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.player_token_account.to_account_info(),
+            to: ctx.accounts.vault.to_account_info(),
+            authority: ctx.accounts.player.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        token::transfer(cpi_ctx, stake_amount)?;
+
+        emit!(PlayerJoinedEvent {
+            duel_id,
+            player: ctx.accounts.player.key(),
+            stake: stake_amount,
+        });
+
+        Ok(())
+    }
+
+    /// Step 2: Execute the battle through MPC
+    pub fn start_battle(
+        ctx: Context<StartBattle>,
+        computation_offset: u64,
+        player1_pubkey: [u8; 32],
+        player1_nonce: u128,
+        player2_pubkey: [u8; 32],
+        player2_nonce: u128,
+    ) -> Result<()> {
+        let duel = &ctx.accounts.duel_order;
+
+        require!(
+            duel.status == DuelStatus::ReadyToBattle,
+            ErrorCode::BattleNotReady
+        );
+
+        // Prepare encrypted data for MPC
+        let args = vec![
+            // Player 1 encrypted stats
+            Argument::ArcisPubkey(player1_pubkey),
+            Argument::PlaintextU128(player1_nonce),
+            Argument::EncryptedU16(duel.player1_stats.attack),
+            Argument::EncryptedU16(duel.player1_stats.defense),
+            Argument::EncryptedU16(duel.player1_stats.speed),
+            // Player 2 encrypted stats
+            Argument::ArcisPubkey(player2_pubkey),
+            Argument::PlaintextU128(player2_nonce),
+            Argument::EncryptedU16(duel.player2_stats.attack),
+            Argument::EncryptedU16(duel.player2_stats.defense),
+            Argument::EncryptedU16(duel.player2_stats.speed),
+        ];
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            None,
+            vec![ExecuteBattleCallback::callback_ix(&[])],
+        )?;
+
+        let duel = &mut ctx.accounts.duel_order;
+        duel.status = DuelStatus::BattleInProgress;
+
+        Ok(())
+    }
+
+    /// Step 3: Handle battle result from MPC
+    #[arcium_callback(encrypted_ix = "execute_battle")]
+    pub fn execute_battle_callback(
+        ctx: Context<ExecuteBattleCallback>,
+        output: ComputationOutputs<ExecuteBattleOutput>,
+    ) -> Result<()> {
+        let result = match output {
+            ComputationOutputs::Success(ExecuteBattleOutput { field_0 }) => field_0,
+            _ => return Err(ErrorCode::BattleFailed.into()),
+        };
+
+        let duel = &mut ctx.accounts.duel_order;
+
+        match result {
+            1 => {
+                duel.winner = duel.player1;
+                msg!("Player 1 wins!");
+            }
+            2 => {
+                duel.winner = duel.player2;
+                msg!("Player 2 wins!");
+            }
+            _ => {
+                duel.winner = Pubkey::default();
+                msg!("Draw!");
+            }
+        }
+
+        duel.status = DuelStatus::Completed;
+
+        emit!(BattleCompletedEvent {
+            duel_id: duel.duel_id,
+            winner: duel.winner,
+        });
+
+        Ok(())
+    }
+
+    /// Step 4: Release assets from vault
+    pub fn claim_rewards(ctx: Context<ClaimRewards>) -> Result<()> {
+        let duel = &ctx.accounts.duel_order;
+
+        require!(
+            duel.status == DuelStatus::Completed,
+            ErrorCode::BattleNotCompleted
+        );
+
+        let is_player1 = ctx.accounts.winner.key() == duel.player1;
+        let is_player2 = ctx.accounts.winner.key() == duel.player2;
+
+        require!(is_player1 || is_player2, ErrorCode::NotAParticipant);
+
+        let amount = if duel.winner == ctx.accounts.winner.key() {
+            // Winner gets both stakes
+            duel.stake_amount * 2
+        } else if duel.winner == Pubkey::default() {
+            // Draw - return original stake
+            duel.stake_amount
+        } else {
+            // Loser gets nothing
+            0
+        };
+
+        if amount > 0 {
+            let duel_order_key = ctx.accounts.duel_order.key();
+            let player1_mint = ctx.accounts.duel_order.player1_mint;
+            let player2_mint = ctx.accounts.duel_order.player2_mint;
+
+            let player1_vault_seeds: &[&[u8]; 4] = &[
+                b"vault",
+                duel_order_key.as_ref(),
+                player1_mint.as_ref(),
+                &[ctx.bumps.player1_vault],
+            ];
+            let player1_vault_signer = &[&player1_vault_seeds[..]];
+
+            let cpi_accounts_p1 = Transfer {
+                from: ctx.accounts.player1_vault.to_account_info(),
+                to: ctx.accounts.winner_token_account.to_account_info(),
+                authority: ctx.accounts.player1_vault.to_account_info(),
+            };
+            let cpi_program = ctx.accounts.token_program.to_account_info();
+            let cpi_ctx =
+                CpiContext::new_with_signer(cpi_program, cpi_accounts_p1, player1_vault_signer);
+            token::transfer(cpi_ctx, ctx.accounts.player1_vault.amount)?;
+
+            let player2_vault_seeds = &[
+                b"vault",
+                duel_order_key.as_ref(),
+                player2_mint.as_ref(),
+                &[ctx.bumps.player2_vault],
+            ];
+            let player2_vault_signer = &[&player2_vault_seeds[..]];
+
+            let cpi_accounts_p2 = Transfer {
+                from: ctx.accounts.player2_vault.to_account_info(),
+                to: ctx.accounts.winner_token_account2.to_account_info(),
+                authority: ctx.accounts.player2_vault.to_account_info(),
+            };
+            let cpi_program = ctx.accounts.token_program.to_account_info();
+            let cpi_ctx =
+                CpiContext::new_with_signer(cpi_program, cpi_accounts_p2, player2_vault_signer);
+            token::transfer(cpi_ctx, ctx.accounts.player2_vault.amount)?;
+        }
+
+        emit!(RewardClaimedEvent {
+            player: ctx.accounts.winner.key(),
+            amount,
+        });
+
+        Ok(())
+    }
 }
